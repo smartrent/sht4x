@@ -76,15 +76,6 @@ defmodule SHT4X do
   ## Callbacks
 
   @impl GenServer
-  @spec init(nil | maybe_improper_list | map) ::
-          {:ok,
-           %{
-             current_measurement: nil,
-             options: keyword(),
-             serial_number: pos_integer(),
-             transport: SHT4X.Transport.t()
-           }}
-          | {:stop, :normal}
   def init(init_arg) do
     bus_name = init_arg[:bus_name] || @default_bus_name
     bus_address = @bus_address
@@ -105,6 +96,7 @@ defmodule SHT4X do
       state = %{
         options: options,
         current_measurement: nil,
+        last_raw_measurement: nil,
         serial_number: serial_number,
         transport: transport
       }
@@ -130,19 +122,29 @@ defmodule SHT4X do
 
   @impl GenServer
   def handle_info(:do_measure, state) do
-    new_state =
-      case SHT4X.Comm.measure(state.transport, state.options) do
-        {:ok, data} ->
-          compensation_callback = state.options[:compensation_callback]
-          measurement_raw = SHT4X.Measurement.from_raw(data)
-          measurement_compensated = compensation_callback.(measurement_raw)
-          %{state | current_measurement: measurement_compensated}
+    compensation_callback = state.options[:compensation_callback]
 
-        _ ->
-          state
-      end
+    case SHT4X.Comm.measure(state.transport, state.options) do
+      {:ok, data} ->
+        measurement_raw = SHT4X.Measurement.from_raw(data)
+        measurement_compensated = compensation_callback.(measurement_raw)
 
-    {:noreply, new_state}
+        {:noreply,
+         %{
+           state
+           | current_measurement: measurement_compensated,
+             last_raw_measurement: measurement_raw
+         }}
+
+      _ ->
+        # Always call the compensation function on the last good raw reading we had, if there is one.
+        if state.last_raw_measurement == nil do
+          {:noreply, state}
+        else
+          measurement_compensated = compensation_callback.(state.last_raw_measurement)
+          {:noreply, %{state | current_measurement: measurement_compensated}}
+        end
+    end
   end
 
   @impl GenServer
