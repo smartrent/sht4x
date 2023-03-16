@@ -8,14 +8,39 @@ defmodule SHT4X do
   require Logger
 
   @typedoc """
+  Compensation callback function
+  """
+  @type compensation_callback :: (SHT4X.Measurement.t() -> SHT4X.Measurement.t()) | nil
+
+  @typedoc """
   SHT4X GenServer start_link options
   * `:name` - a name for the GenServer
   * `:bus_name` - which I2C bus to use (e.g., `"i2c-1"`)
   * `:retries` - the number of retries before failing (defaults to no retries)
+  * `:compensation_callback` - a function that takes in a `SHT4X.Measurement.t()` and returns a potentially modified `SHT4X.Measurement.t()`
+  * `:measurement_interval` - how often data will be read from the sensor
+  * `:repeatability` - accuracy of the requested sensor read (`:low`, `:medium`, or `:high`)
+  * Also accepts all other standard `GenServer` start_link options
   """
-  @type options() :: [GenServer.option() | {:bus_name, binary}]
+  @type option ::
+          {:debug, GenServer.debug()}
+          | {:name, GenServer.name()}
+          | {:timeout, GenServer.timeout()}
+          | {:spawn_opt, [Process.spawn_opt()]}
+          | {:hibernate_after, GenServer.timeout()}
+          | {:bus_name, binary()}
+          | {:retries, pos_integer()}
+          | {:compensation_callback, compensation_callback()}
+          | {:measurement_interval, pos_integer()}
+          | {:repeatability, :low | :medium | :high}
+
+  @type options :: [option()]
 
   @default_bus_name "i2c-1"
+  @default_interval 5_000
+  @default_retries 3
+  @default_repeatability :high
+  @default_func &Function.identity/1
   @bus_address 0x44
 
   ## Public API
@@ -26,7 +51,15 @@ defmodule SHT4X do
   @spec start_link(options()) :: GenServer.on_start()
   def start_link(opts \\ []) do
     gen_server_opts = Keyword.take(opts, [:name, :debug, :timeout, :spawn_opt, :hibernate_after])
-    init_arg = Keyword.take(opts, [:bus_name, :retries])
+
+    init_arg =
+      Keyword.take(opts, [
+        :bus_name,
+        :retries,
+        :compensation_callback,
+        :measurement_interval,
+        :repeatability
+      ])
 
     GenServer.start_link(__MODULE__, init_arg, gen_server_opts)
   end
@@ -43,23 +76,45 @@ defmodule SHT4X do
   ## Callbacks
 
   @impl GenServer
+  @spec init(nil | maybe_improper_list | map) ::
+          {:ok,
+           %{
+             current_measurement: nil,
+             options: keyword(),
+             serial_number: pos_integer(),
+             transport: SHT4X.Transport.t()
+           }}
+          | {:stop, :normal}
   def init(init_arg) do
     bus_name = init_arg[:bus_name] || @default_bus_name
     bus_address = @bus_address
-    retries = init_arg[:retries] || 0
 
     Logger.info(
       "[SHT4X] Starting on bus #{bus_name} at address #{inspect(bus_address, base: :hex)}"
     )
 
-    with {:ok, transport} <- SHT4X.Transport.new(bus_name, bus_address, retries),
-         {:ok, serial_number} <- SHT4X.Comm.serial_number(transport) do
-      Logger.info("[SHT4X] Initializing sensor #{serial_number}")
+    options = [
+      retries: Keyword.get(init_arg, :retries, @default_retries),
+      compensation_callback: Keyword.get(init_arg, :compensation_callback, @default_func),
+      measurement_interval: Keyword.get(init_arg, :measurement_interval, @default_interval),
+      repeatability: Keyword.get(init_arg, :repeatability, @default_repeatability)
+    ]
 
+    with {:ok, transport} <- SHT4X.Transport.new(bus_name, bus_address, options[:retries]),
+         {:ok, serial_number} <- SHT4X.Comm.serial_number(transport) do
       state = %{
+        options: options,
+        current_measurement: nil,
         serial_number: serial_number,
         transport: transport
       }
+
+      interval = Keyword.get(init_arg, :measurement_interval, @default_interval)
+      :timer.send_interval(interval, :do_measure)
+
+      Logger.info(
+        "[SHT4X] Initializing | S/N: #{serial_number} | Options: #{inspect(state.options)}"
+      )
 
       {:ok, state}
     else
@@ -74,8 +129,28 @@ defmodule SHT4X do
   end
 
   @impl GenServer
-  def handle_call({:measure, opts}, _from, state) do
-    {:ok, data} = SHT4X.Comm.measure(state.transport, opts)
-    {:reply, {:ok, SHT4X.Measurement.from_raw(data, opts)}, state}
+  def handle_info(:do_measure, state) do
+    new_state =
+      case SHT4X.Comm.measure(state.transport, state.options) do
+        {:ok, data} ->
+          compensation_callback = state.options[:compensation_callback]
+          measurement_raw = SHT4X.Measurement.from_raw(data)
+          measurement_compensated = compensation_callback.(measurement_raw)
+          %{state | current_measurement: measurement_compensated}
+
+        _ ->
+          state
+      end
+
+    {:noreply, new_state}
+  end
+
+  @impl GenServer
+  def handle_call(:measure, _from, state) do
+    if state.current_measurement == nil do
+      {:reply, {:error, :no_data}, state}
+    else
+      {:reply, {:ok, state.current_measurement}, state}
+    end
   end
 end
